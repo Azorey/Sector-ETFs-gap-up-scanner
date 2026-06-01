@@ -11,8 +11,8 @@ on:
     inputs:
       force_run:
         description: "Force run even outside the alert window"
-        required: false
-        default: "false"
+        required: true
+        default: "true"
 
 jobs:
   scan:
