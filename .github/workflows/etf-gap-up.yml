@@ -1,0 +1,48 @@
+name: ETF Gap-Up Scanner
+
+on:
+  schedule:
+    # Runs at 09:45 America/New_York, Monday-Friday.
+    # The Python script still checks whether NYSE is actually open.
+    - cron: "45 9 * * 1-5"
+      timezone: "America/New_York"
+
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Force run even outside the alert window"
+        required: false
+        default: "false"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ETF gap-up scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Optional repo variables.
+          # Defaults are also handled in Python if these are not set.
+          GAP_THRESHOLD_PCT: ${{ vars.GAP_THRESHOLD_PCT }}
+          NOTIFY_WHEN_NONE: ${{ vars.NOTIFY_WHEN_NONE }}
+          ALERT_WINDOW_MINUTES: ${{ vars.ALERT_WINDOW_MINUTES }}
+
+          # Manual run helper.
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+        run: python etf_gap_up_scanner.py
