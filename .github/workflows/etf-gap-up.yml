@@ -1,23 +1,59 @@
-name: ETF Gap-Up Scanner
+name: ETF Premarket and Gap-Up Scanner
 
 on:
   schedule:
-    # Runs at 09:45 America/New_York, Monday-Friday.
-    # The Python script still checks whether NYSE is actually open.
-    - cron: "45 9 * * 1-5"
+    # Best-effort premarket scans. GitHub Actions does not guarantee exact
+    # schedule times, so several off-peak triggers are used. The script
+    # automatically changes a delayed premarket run into an open confirmation.
+    - cron: "32-57/5 7 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "2-57/5 8 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "2-27/5 9 * * 1-5"
+      timezone: "America/New_York"
+
+    # Open confirmation plus backups. Later triggers can finish a partial scan.
+    - cron: "33-58/5 9 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "8 10 * * 1-5"
       timezone: "America/New_York"
 
   workflow_dispatch:
     inputs:
-      force_run:
-        description: "Force run even outside the alert window"
+      scan_phase:
+        description: "Scan phase; auto chooses from current New York time"
         required: true
-        default: "true"
+        type: choice
+        options:
+          - auto
+          - premarket
+          - open
+        default: auto
+      force_run:
+        description: "Allow a manual premarket scan earlier than the 2-hour window"
+        required: true
+        type: boolean
+        default: true
+      resend:
+        description: "Ignore today's dedup state and resend the selected phase"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: etf-gap-up-scanner-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   scan:
+    # Notification state is branch-scoped in Actions cache. Limiting execution
+    # to the default branch prevents manual branch tests from double-notifying.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repo
@@ -27,22 +63,68 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run ETF gap-up scanner
+      - name: Determine New York trading date
+        id: session
+        shell: bash
+        run: echo "ny_date=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+
+      # A unique save key plus a date-scoped restore prefix keeps the newest
+      # same-day state while allowing every run to save an immutable cache.
+      - name: Restore today's notification state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: etf-gap-state-${{ steps.session.outputs.ny_date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            etf-gap-state-${{ steps.session.outputs.ny_date }}-
+
+      - name: Run ETF premarket and gap-up scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # Optional repo variables.
-          # Defaults are also handled in Python if these are not set.
+          # Existing setting: regular-session opening-gap threshold.
           GAP_THRESHOLD_PCT: ${{ vars.GAP_THRESHOLD_PCT }}
           NOTIFY_WHEN_NONE: ${{ vars.NOTIFY_WHEN_NONE }}
-          ALERT_WINDOW_MINUTES: ${{ vars.ALERT_WINDOW_MINUTES }}
 
-          # Manual run helper.
-          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          # Optional premarket settings. Empty repo variables use Python defaults:
+          # same threshold as GAP_THRESHOLD_PCT, 15-minute lookback/staleness,
+          # at least 3 non-zero-volume bars / 100 shares, and a 2-hour lead.
+          PREMARKET_THRESHOLD_PCT: ${{ vars.PREMARKET_THRESHOLD_PCT }}
+          PREMARKET_LOOKBACK_MINUTES: ${{ vars.PREMARKET_LOOKBACK_MINUTES }}
+          PREMARKET_MAX_STALENESS_MINUTES: ${{ vars.PREMARKET_MAX_STALENESS_MINUTES }}
+          PREMARKET_MIN_VALID_BARS: ${{ vars.PREMARKET_MIN_VALID_BARS }}
+          PREMARKET_MIN_RECENT_VOLUME: ${{ vars.PREMARKET_MIN_RECENT_VOLUME }}
+          PREMARKET_MAX_LEAD_MINUTES: ${{ vars.PREMARKET_MAX_LEAD_MINUTES }}
+          PREMARKET_MIN_COVERAGE_PCT: ${{ vars.PREMARKET_MIN_COVERAGE_PCT }}
+          PREMARKET_NOTIFY_WHEN_NONE: ${{ vars.PREMARKET_NOTIFY_WHEN_NONE }}
+
+          # Data-quality gates and retry settings. Late first-trade bars remain
+          # provisional for 15 minutes; partial finalization waits 35 minutes.
+          MIN_REFERENCE_COVERAGE_PCT: ${{ vars.MIN_REFERENCE_COVERAGE_PCT }}
+          OPEN_MIN_COVERAGE_PCT: ${{ vars.OPEN_MIN_COVERAGE_PCT }}
+          OPEN_PROVISIONAL_AFTER_MINUTES: ${{ vars.OPEN_PROVISIONAL_AFTER_MINUTES }}
+          OPEN_HARD_DEADLINE_MINUTES: ${{ vars.OPEN_HARD_DEADLINE_MINUTES }}
+          OPEN_DATA_RETRY_COUNT: ${{ vars.OPEN_DATA_RETRY_COUNT }}
+          OPEN_DATA_RETRY_SECONDS: ${{ vars.OPEN_DATA_RETRY_SECONDS }}
+          YAHOO_MAX_THREADS: ${{ vars.YAHOO_MAX_THREADS }}
+
+          # Scheduled runs use auto. Manual runs expose all three controls above.
+          SCAN_PHASE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_phase || 'auto' }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || false }}
+          RESEND: ${{ github.event_name == 'workflow_dispatch' && inputs.resend || false }}
+          STATE_FILE: .state/etf-gap-up.json
+
         run: python etf_gap_up_scanner.py
+
+      - name: Save today's notification state
+        if: ${{ always() && hashFiles('.state/etf-gap-up.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: etf-gap-state-${{ steps.session.outputs.ny_date }}-${{ github.run_id }}-${{ github.run_attempt }}
